@@ -61,11 +61,14 @@ static const char rcsid[] _U_ =
 
 #endif /* WIN32 */
 
+#include <ctype.h>
+#include <errno.h>
 #include <stdlib.h>
 #include <string.h>
 #include <memory.h>
 #include <setjmp.h>
 #include <stdarg.h>
+#include <stdio.h>
 
 #ifdef MSDOS
 #include "pcap-dos.h"
@@ -397,6 +400,96 @@ syntax()
 	bpf_error("syntax error in filter expression");
 }
 
+/*
+ * Parses one instruction from a bpf_dump output. Supports two styles of
+ * instructions: "{ 0x6, 0, 0, 0x00000060 }," and "6 0 0 96" although the parser
+ * is somewhat lax and tolerates a few variations around those canonical styles.
+ * If "ins" is NULL, the instruction is parsed, but the result is discarded.
+ * Returns NULL on failure, and a pointer to the first character after the
+ * instrcution on success.
+ */
+static const char *
+get_instruction_from_dump(struct bpf_insn *ins, const char *buf)
+{
+	unsigned long items[4];
+	char *next;
+	enum { C_CODE, DECIMAL_NUMBERS } style = DECIMAL_NUMBERS;
+	int k;
+	if (*buf == '{') {
+		style = C_CODE;
+		while (isblank(*(unsigned char *)++buf))
+			/* nothing */ ;
+	} else if (!isdigit(*buf))
+		return NULL;
+	for (k = 0; k < sizeof(items) / sizeof(*items); k++) {
+		items[k] = strtoul(buf, &next, 0);
+		if (next <= buf)
+			return NULL;
+		for (buf = next;
+		     isblank(*(unsigned char *)buf) || *buf == ',';
+		     buf++)
+			/* nothing */ ;
+		if (buf <= next && k < sizeof(items) / sizeof(*items) - 1)
+			return NULL;
+	}
+	switch (style) {
+		case C_CODE:
+			if (*buf++ != '}')
+				return NULL;
+			if (*buf == ',')
+				buf++;
+			break;
+		case DECIMAL_NUMBERS:
+			break;
+	}
+	if (ins != NULL) {
+		ins->code = (u_short) items[0];
+		ins->jt = (u_char) items[1];
+		ins->jf = (u_char) items[2];
+		ins->k = (bpf_u_int32) items[3];
+	}
+	return buf;
+}
+
+/*
+ * Parse the output of a bpf_dump call. Doesn't support human readable form.
+ * Return 0 on success, -1 on parse error, -2 on malloc failure.
+ */
+static int
+parse_bpf_dump(struct bpf_program *program, const char *buf)
+{
+	struct bpf_insn *ins = NULL;
+	const char *next;
+	size_t i;
+	int pass;
+	for (pass = 0; pass < 2; pass++) {
+		i = 0;
+		next = buf;
+		while (*next != '\0') {
+			while (isspace(*(unsigned char *)next))
+			     next++;
+			if (*next == '\0')
+				break;
+			next = get_instruction_from_dump(ins, next);
+			if (next == NULL)
+				return -1;
+			if (ins != NULL)  /* true only during the second pass */
+				ins++;
+			i++;
+		}
+		if (!i)
+			return -1;
+		if (pass < 1) {
+			ins = malloc(i * sizeof(*program->bf_insns));
+			if (ins == NULL)
+				return -2;
+			program->bf_insns = ins;
+			program->bf_len = (u_int)i;
+		}
+	}
+	return 0;
+}
+
 static bpf_u_int32 netmask;
 static int snaplen;
 int no_optimize;
@@ -434,8 +527,23 @@ pcap_compile(pcap_t *p, struct bpf_program *program,
 	u_int len;
 
 	/*
+	 * First, attempt to interpret buf as a dump of an already compiled
+	 * pcap program.
+ 	 */
+	switch (parse_bpf_dump(program, buf)) {
+		case 0:
+			return (0);
+		case -2:
+			(void)snprintf(p->errbuf, sizeof(p->errbuf),
+                                       "malloc: %s", pcap_strerror(errno));
+			return (PCAP_ERROR);
+		default:  /* Parse error, interpret buf as a bpf expression. */
+			break;
+	}
+
+	/*
 	 * If this pcap_t hasn't been activated, it doesn't have a
-	 * link-layer type, so we can't use it.
+	 * link-layer type, so we can't use it to create a filter.
 	 */
 	if (!p->activated) {
 		snprintf(p->errbuf, PCAP_ERRBUF_SIZE,
