@@ -406,7 +406,7 @@ syntax()
  * is somewhat lax and tolerates a few variations around those canonical styles.
  * If "ins" is NULL, the instruction is parsed, but the result is discarded.
  * Returns NULL on failure, and a pointer to the first character after the
- * instrcution on success.
+ * instruction on success.
  */
 static const char *
 get_instruction_from_dump(struct bpf_insn *ins, const char *buf)
